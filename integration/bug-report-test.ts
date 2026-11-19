@@ -64,27 +64,46 @@ test.beforeAll(async () => {
     // `createFixture` will make an app and run your tests against it.
     ////////////////////////////////////////////////////////////////////////////
     files: {
-      "app/routes/_index.tsx": js`
-        import { useLoaderData, Link } from "react-router";
+      "app/styled.css": `.styled { color: rebeccapurple; }`,
 
-        export function loader() {
-          return "pizza";
-        }
+      "app/routes/_index.tsx": js`
+        import { Link } from "react-router";
 
         export default function Index() {
-          let data = useLoaderData();
           return (
             <div>
-              {data}
-              <Link to="/burgers">Other Route</Link>
+              <p>home page</p>
+              <Link to="/styled">Styled</Link>
             </div>
-          )
+          );
         }
       `,
 
-      "app/routes/burgers.tsx": js`
-        export default function Index() {
-          return <div>cheeseburger</div>;
+      // Its loader redirects once the "session" cookie says the session ended.
+      "app/routes/styled.tsx": js`
+        import { Link, redirect } from "react-router";
+        import "../styled.css";
+
+        export function loader({ request }) {
+          if (request.headers.get("Cookie")?.includes("session=ended")) {
+            throw redirect("/login");
+          }
+          return null;
+        }
+
+        export default function Styled() {
+          return (
+            <div className="styled">
+              <p>styled page</p>
+              <Link to="/">Home</Link>
+            </div>
+          );
+        }
+      `,
+
+      "app/routes/login.tsx": js`
+        export default function Login() {
+          return <p>login page</p>;
         }
       `,
     },
@@ -103,22 +122,47 @@ test.afterAll(() => {
 // add a good description for what you expect React Router to do 👇🏽
 ////////////////////////////////////////////////////////////////////////////////
 
-test("[description of what you expect it to do]", async ({ page }) => {
+test("a loader redirect thrown while the route's stylesheet preloads is not an unhandled rejection", async ({
+  page,
+  context,
+}) => {
   let app = new PlaywrightFixture(appFixture, page);
-  // You can test any request your app might get using `fixture`.
-  let response = await fixture.requestDocument("/");
-  expect(await response.text()).toMatch("pizza");
+  await page.addInitScript(() => {
+    (window as any).__unhandled = [];
+    window.addEventListener("unhandledrejection", (event) => {
+      let reason = event.reason;
+      (window as any).__unhandled.push(
+        reason instanceof Response
+          ? `Response ${reason.status} to ${reason.headers.get("Location")}`
+          : String(reason),
+      );
+    });
+  });
 
-  // If you need to test interactivity use the `app`
+  // Visit /styled, then go back. Its route module stays in the module cache,
+  // but its <link rel="stylesheet"> leaves the document.
   await app.goto("/");
-  await app.clickLink("/burgers");
-  await page.waitForSelector("text=cheeseburger");
+  await app.clickLink("/styled");
+  await page.waitForSelector("text=styled page");
+  await app.clickLink("/");
+  await page.waitForSelector("text=home page");
 
-  // If you're not sure what's going on, you can "poke" the app, it'll
-  // automatically open up in your browser for 20 seconds, so be quick!
-  // await app.poke(20);
+  // End the session, and make the stylesheet load slower than the loader's
+  // .data response (as when the browser revalidates it after a tab sat idle).
+  await context.addCookies([
+    { name: "session", value: "ended", url: appFixture.serverUrl },
+  ]);
+  let cdp = await context.newCDPSession(page);
+  await cdp.send("Network.setCacheDisabled", { cacheDisabled: true });
+  await page.route(/\.css$/, async (route) => {
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    await route.continue();
+  });
 
-  // Go check out the other tests to see what else you can do.
+  await app.clickLink("/styled");
+  await page.waitForSelector("text=login page");
+
+  expect(await page.evaluate(() => (window as any).__unhandled)).toEqual([]);
 });
 
 ////////////////////////////////////////////////////////////////////////////////
